@@ -61,6 +61,8 @@ COPY --from=builder /wheels/ /wheels/
 # Install the built wheel using pip; again using a wildcard if it's the only file
 RUN pip install *.whl /wheels/* --no-index --find-links=/wheels/ && rm -f *.whl && rm -rf /wheels
 
+COPY application_default_credentials.json /root/.config/gcloud/application_default_credentials.json
+RUN pip install json_repair
 # Generate prisma client
 RUN prisma generate
 RUN chmod +x entrypoint.sh

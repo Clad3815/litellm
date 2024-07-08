@@ -1,18 +1,25 @@
-import json
-import time
-import traceback
-import types
-import uuid
 from itertools import chain
-from typing import Optional
-
-import aiohttp
-import httpx
 import requests
-
-import litellm
+import types
+import time
+import json
+import uuid
+import traceback
+from typing import Optional, Dict, Any, List
 from litellm import verbose_logger
+import litellm
+import httpx
+import aiohttp
+import re
+import json_repair
+import difflib
 
+FUNCTION_CALL_START = "<|im_function_call_start|>"
+FUNCTION_CALL_END = "<|im_function_call_end|>"
+
+def is_function_call(content):
+    pattern = re.escape(FUNCTION_CALL_START) + r'.*?' + re.escape(FUNCTION_CALL_END)
+    return bool(re.search(pattern, content, re.DOTALL))
 
 class OllamaError(Exception):
     def __init__(self, status_code, message):
@@ -170,7 +177,7 @@ class OllamaChatConfig:
             ### FUNCTION CALLING LOGIC ###
             if param == "tools":
                 # ollama actually supports json output
-                optional_params["format"] = "json"
+                # optional_params["format"] = "json" # Don't force JSON, as we the user may need text output with tools usage
                 litellm.add_function_to_prompt = (
                     True  # so that main.py adds the function call to the prompt
                 )
@@ -183,7 +190,7 @@ class OllamaChatConfig:
 
             if param == "functions":
                 # ollama actually supports json output
-                optional_params["format"] = "json"
+                # optional_params["format"] = "json" # Don't force JSON, as we the user may need text output with tools usage
                 litellm.add_function_to_prompt = (
                     True  # so that main.py adds the function call to the prompt
                 )
@@ -195,9 +202,63 @@ class OllamaChatConfig:
         return optional_params
 
 
+def parse_response_with_function_calls(content):    
+    # Pattern to match function calls including start and end tags
+    pattern = re.escape(FUNCTION_CALL_START) + r'(.*?)' + re.escape(FUNCTION_CALL_END)
+    
+    # Find all function calls
+    function_calls = list(re.finditer(pattern, content, re.DOTALL))
+    
+    tool_calls = []
+    message_parts = []
+    last_end = 0
+    
+    for match in function_calls:
+        # Add text before this function call to message_parts
+        pre_text = content[last_end:match.start()].strip()
+        if pre_text:
+            message_parts.append(pre_text)
+        
+        # Process the function call
+        json_str = match.group(1).strip()
+        try:
+            function_data = json.loads(json_str)
+            tool_call = {
+                "id": f"call_{str(uuid.uuid4())}",
+                "function": {
+                    "name": function_data["name"],
+                    "arguments": json.dumps(function_data["arguments"]),
+                },
+                "type": "function",
+            }
+            tool_calls.append(tool_call)
+        except json.JSONDecodeError:
+            # If JSON parsing fails, treat it as normal text
+            message_parts.append(match.group(0))
+        
+        last_end = match.end()
+    
+    # Add any remaining text after the last function call
+    post_text = content[last_end:].strip()
+    if post_text:
+        message_parts.append(post_text)
+    
+    # Join all non-empty parts of message_content
+    final_message_content = ' '.join(message_parts).strip()
+    
+    print({
+        "content": final_message_content,
+        "tool_calls": tool_calls
+    })
+    message = litellm.Message(
+        content=final_message_content if final_message_content else None,
+        tool_calls=tool_calls if tool_calls else None
+    )
+    
+    return message
+
 # ollama implementation
 def get_ollama_response(
-    model_response: litellm.ModelResponse,
     api_base="http://localhost:11434",
     api_key: Optional[str] = None,
     model="llama2",
@@ -205,6 +266,7 @@ def get_ollama_response(
     optional_params=None,
     logging_obj=None,
     acompletion: bool = False,
+    model_response=None,
     encoding=None,
 ):
     if api_base.endswith("/api/chat"):
@@ -215,14 +277,10 @@ def get_ollama_response(
     ## Load Config
     config = litellm.OllamaChatConfig.get_config()
     for k, v in config.items():
-        if (
-            k not in optional_params
-        ):  # completion(top_k=3) > cohere_config(top_k=3) <- allows for dynamic variables to be passed in
+        if k not in optional_params:
             optional_params[k] = v
 
     stream = optional_params.pop("stream", False)
-    format = optional_params.pop("format", None)
-    function_name = optional_params.pop("function_name", None)
 
     for m in messages:
         if "role" in m and m["role"] == "tool":
@@ -234,8 +292,7 @@ def get_ollama_response(
         "options": optional_params,
         "stream": stream,
     }
-    if format is not None:
-        data["format"] = format
+
     ## LOGGING
     logging_obj.pre_call(
         input=None,
@@ -247,6 +304,7 @@ def get_ollama_response(
             "acompletion": acompletion,
         },
     )
+    
     if acompletion is True:
         if stream == True:
             response = ollama_async_streaming(
@@ -265,7 +323,6 @@ def get_ollama_response(
                 model_response=model_response,
                 encoding=encoding,
                 logging_obj=logging_obj,
-                function_name=function_name,
             )
         return response
     elif stream == True:
@@ -279,7 +336,7 @@ def get_ollama_response(
     }
     if api_key is not None:
         _request["headers"] = "Bearer {}".format(api_key)
-    response = requests.post(**_request)  # type: ignore
+    response = requests.post(**_request)
     if response.status_code != 200:
         raise OllamaError(status_code=response.status_code, message=response.text)
 
@@ -297,43 +354,28 @@ def get_ollama_response(
     response_json = response.json()
 
     ## RESPONSE OBJECT
-    model_response.choices[0].finish_reason = "stop"
-    if data.get("format", "") == "json":
-        function_call = json.loads(response_json["message"]["content"])
-        message = litellm.Message(
-            content=None,
-            tool_calls=[
-                {
-                    "id": f"call_{str(uuid.uuid4())}",
-                    "function": {
-                        "name": function_call["name"],
-                        "arguments": json.dumps(function_call["arguments"]),
-                    },
-                    "type": "function",
-                }
-            ],
-        )
-        model_response.choices[0].message = message  # type: ignore
-        model_response.choices[0].finish_reason = "tool_calls"
+    model_response["choices"][0]["finish_reason"] = "stop"
+    
+    content = response_json["message"]["content"]
+    if is_function_call(content):
+        message = parse_response_with_function_calls(content)
+        model_response["choices"][0]["message"] = message
+        model_response["choices"][0]["finish_reason"] = "tool_calls"
     else:
-        model_response.choices[0].message.content = response_json["message"]["content"]  # type: ignore
-    model_response.created = int(time.time())
-    model_response.model = "ollama/" + model
-    prompt_tokens = response_json.get("prompt_eval_count", litellm.token_counter(messages=messages))  # type: ignore
+        model_response["choices"][0]["message"]["content"] = content
+
+    model_response["created"] = int(time.time())
+    model_response["model"] = "ollama/" + model
+    prompt_tokens = response_json.get("prompt_eval_count", litellm.token_counter(messages=messages))
     completion_tokens = response_json.get(
         "eval_count", litellm.token_counter(text=response_json["message"]["content"])
     )
-    setattr(
-        model_response,
-        "usage",
-        litellm.Usage(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens,
-        ),
+    model_response["usage"] = litellm.Usage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=prompt_tokens + completion_tokens,
     )
     return model_response
-
 
 def ollama_completion_stream(url, api_key, data, logging_obj):
     _request = {
@@ -463,14 +505,13 @@ async def ollama_acompletion(
     url,
     api_key: Optional[str],
     data,
-    model_response: litellm.ModelResponse,
+    model_response,
     encoding,
     logging_obj,
-    function_name,
 ):
     data["stream"] = False
     try:
-        timeout = aiohttp.ClientTimeout(total=litellm.request_timeout)  # 10 minutes
+        timeout = aiohttp.ClientTimeout(total=litellm.request_timeout)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             _request = {
                 "url": f"{url}",
@@ -498,50 +539,29 @@ async def ollama_acompletion(
             )
 
             ## RESPONSE OBJECT
-            model_response.choices[0].finish_reason = "stop"
-            if data.get("format", "") == "json":
-                function_call = json.loads(response_json["message"]["content"])
-                message = litellm.Message(
-                    content=None,
-                    tool_calls=[
-                        {
-                            "id": f"call_{str(uuid.uuid4())}",
-                            "function": {
-                                "name": function_call.get("name", function_name),
-                                "arguments": json.dumps(
-                                    function_call.get("arguments", function_call)
-                                ),
-                            },
-                            "type": "function",
-                        }
-                    ],
-                )
-                model_response.choices[0].message = message  # type: ignore
-                model_response.choices[0].finish_reason = "tool_calls"
+            model_response["choices"][0]["finish_reason"] = "stop"
+            
+            content = response_json["message"]["content"]
+            if is_function_call(content):
+                message = parse_response_with_function_calls(content)
+                model_response["choices"][0]["message"] = message
+                model_response["choices"][0]["finish_reason"] = "tool_calls"
             else:
-                model_response.choices[0].message.content = response_json[  # type: ignore
-                    "message"
-                ][
-                    "content"
-                ]
+                model_response["choices"][0]["message"]["content"] = content
 
-            model_response.created = int(time.time())
-            model_response.model = "ollama_chat/" + data["model"]
-            prompt_tokens = response_json.get("prompt_eval_count", litellm.token_counter(messages=data["messages"]))  # type: ignore
+            model_response["created"] = int(time.time())
+            model_response["model"] = "ollama_chat/" + data["model"]
+            prompt_tokens = response_json.get("prompt_eval_count", litellm.token_counter(messages=data["messages"]))
             completion_tokens = response_json.get(
                 "eval_count",
                 litellm.token_counter(
                     text=response_json["message"]["content"], count_response_tokens=True
                 ),
             )
-            setattr(
-                model_response,
-                "usage",
-                litellm.Usage(
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    total_tokens=prompt_tokens + completion_tokens,
-                ),
+            model_response["usage"] = litellm.Usage(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens,
             )
             return model_response
     except Exception as e:

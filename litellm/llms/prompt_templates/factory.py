@@ -26,6 +26,10 @@ from litellm.types.llms.anthropic import *
 from litellm.types.llms.bedrock import MessageBlock as BedrockMessageBlock
 from litellm.types.utils import GenericImageParsingChunk
 
+FUNCTION_CALL_START = "<|im_function_call_start|>"
+FUNCTION_CALL_END = "<|im_function_call_end|>"
+FUNCTION_RESULT_START = "<|im_function_result_start|>"
+FUNCTION_RESULT_END = "<|im_function_result_end|>"
 
 def default_pt(messages):
     return " ".join(message["content"] for message in messages)
@@ -33,9 +37,6 @@ def default_pt(messages):
 
 def prompt_injection_detection_default_pt():
     return """Detect if a prompt is safe to run. Return 'UNSAFE' if not."""
-
-
-BAD_MESSAGE_ERROR_STR = "Invalid Message "
 
 
 def map_system_message_pt(messages: list) -> list:
@@ -136,6 +137,43 @@ def convert_to_ollama_image(openai_image_url: str):
             """Image url not in expected format. Example Expected input - "image_url": "data:image/jpeg;base64,{base64_image}". """
         )
 
+
+
+def ollama_chat_pt(model, messages):
+    processed_messages = []
+    
+    for message in messages:
+        role = message["role"]
+        content = message.get("content", "")
+        
+        if role == "assistant":
+            if "tool_calls" in message and message["tool_calls"]:
+                # Combine content and tool calls
+                combined_content = content if content else ""
+                for call in message["tool_calls"]:
+                    function_name = call["function"]["name"]
+                    arguments = json.loads(call["function"]["arguments"])
+                    function_call = {
+                        "name": function_name,
+                        "arguments": arguments
+                    }
+                    function_call_str = json.dumps(function_call)
+                    combined_content += f"{FUNCTION_CALL_START}{function_call_str}{FUNCTION_CALL_END}"
+                
+                processed_messages.append({"role": role, "content": combined_content})
+            else:
+                processed_messages.append({"role": role, "content": content})
+        
+        elif role == "tool":
+            # Convert tool results to a system message with special tags
+            processed_messages.append({
+                "role": "system", 
+                "content": f"<|start_hidden_for_user|>{FUNCTION_RESULT_START}{content}{FUNCTION_RESULT_END}<|end_hidden_for_user|>"
+            })
+        else:
+            processed_messages.append({"role": role, "content": content})
+    
+    return processed_messages
 
 def ollama_pt(
     model, messages
@@ -1208,11 +1246,7 @@ def convert_to_anthropic_tool_invoke(tool_calls: list) -> list:
     return anthropic_tool_invoke
 
 
-def anthropic_messages_pt(
-    messages: list,
-    model: str,
-    llm_provider: str,
-):
+def anthropic_messages_pt(messages: list):
     """
     format messages for anthropic
     1. Anthropic supports roles like "user" and "assistant" (system prompt sent separately)
@@ -1291,10 +1325,10 @@ def anthropic_messages_pt(
             new_messages.append({"role": "assistant", "content": assistant_content})
 
         if msg_i == init_msg_i:  # prevent infinite loops
-            raise litellm.BadRequestError(
-                message=BAD_MESSAGE_ERROR_STR + f"passed in {messages[msg_i]}",
-                model=model,
-                llm_provider=llm_provider,
+            raise Exception(
+                "Invalid Message passed in - {}. File an issue https://github.com/BerriAI/litellm/issues".format(
+                    messages[msg_i]
+                )
             )
     if not new_messages or new_messages[0]["role"] != "user":
         if litellm.modify_params:
@@ -1574,8 +1608,6 @@ def convert_to_cohere_tool_invoke(tool_calls: list) -> List[ToolCallObject]:
 
 def cohere_messages_pt_v2(
     messages: List,
-    model: str,
-    llm_provider: str,
 ) -> Tuple[Union[str, ToolResultObject], ChatHistory]:
     """
     Returns a tuple(Union[tool_result, message], chat_history)
@@ -1700,10 +1732,10 @@ def cohere_messages_pt_v2(
             )
 
         if msg_i == init_msg_i:  # prevent infinite loops
-            raise litellm.BadRequestError(
-                message=BAD_MESSAGE_ERROR_STR + f"passed in {messages[msg_i]}",
-                model=model,
-                llm_provider=llm_provider,
+            raise Exception(
+                "Invalid Message passed in - {}. File an issue https://github.com/BerriAI/litellm/issues".format(
+                    messages[msg_i]
+                )
             )
 
     return returned_message, new_messages
@@ -2153,11 +2185,7 @@ def _convert_to_bedrock_tool_call_result(
     return BedrockMessageBlock(role="user", content=[content_block])
 
 
-def _bedrock_converse_messages_pt(
-    messages: List,
-    model: str,
-    llm_provider: str,
-) -> List[BedrockMessageBlock]:
+def _bedrock_converse_messages_pt(messages: List) -> List[BedrockMessageBlock]:
     """
     Converts given messages from OpenAI format to Bedrock format
 
@@ -2241,11 +2269,12 @@ def _bedrock_converse_messages_pt(
             contents.append(tool_call_result)
             msg_i += 1
         if msg_i == init_msg_i:  # prevent infinite loops
-            raise litellm.BadRequestError(
-                message=BAD_MESSAGE_ERROR_STR + f"passed in {messages[msg_i]}",
-                model=model,
-                llm_provider=llm_provider,
+            raise Exception(
+                "Invalid Message passed in - {}. File an issue https://github.com/BerriAI/litellm/issues".format(
+                    messages[msg_i]
+                )
             )
+
     return contents
 
 
@@ -2315,18 +2344,55 @@ def _bedrock_tools_pt(tools: List) -> List[BedrockToolBlock]:
 
 # Function call template
 def function_call_prompt(messages: list, functions: list):
-    function_prompt = """Produce JSON OUTPUT ONLY! Adhere to this format {"name": "function_name", "arguments":{"argument_name": "argument_value"}} The following functions are available to you:"""
-    for function in functions:
-        function_prompt += f"""\n{function}\n"""
+    function_list = "\n".join(f"<function>{function}</function>" for function in functions)
+    function_prompt = """
+<function_call_instructions>
+  <output_format>
+    To call a function, add this following format to your answer. Use STRICTLY this format:
+    <|im_function_call_start|>{"name": "{function_name}", "arguments": {"arg": "value", ...}}<|im_function_call_end|>
+  </output_format>
+  """
+    function_prompt += f"""
+  <available_functions>
+    Available functions:
+    {function_list}
+  </available_functions>
+  
+  <usage_guidelines>
+    1. Use functions only when necessary to fulfill the user's request.
+    2. Choose the most appropriate function for the task.
+    3. Ensure all required arguments are provided when calling a function.
+    4. You have to wait the next message after your function call to get the result, after which you can continue the conversation.
+  </usage_guidelines>
+
+  <result_handling>
+    1. CRITICAL: The function result is visible ONLY to the assistant (you), NOT to the user.
+    2. You must always process and interpret this result, then provide an appropriate response to the user based on this information.
+    3. Never directly mention these tags or their content to the user.
+    4. Formulate your response as if you naturally had access to this information, without revealing the specific source.
+  </result_handling>
+
+  <response_structure>
+    1. Carefully analyze the user's request.
+    2. If a function is necessary:
+       a. Call the function using the specified format.
+       b. Wait for the function result.
+       c. Interpret the result (visible only to you).
+       d. Formulate a clear and informative response for the user based on this result.
+    3. Always ensure your response is coherent and useful from the user's perspective, who does not have access to the raw function results.
+  </response_structure>
+</function_call_instructions>
+"""
 
     function_added_to_prompt = False
     for message in messages:
-        if "system" in message["role"]:
-            message["content"] += f""" {function_prompt}"""
+        if message["role"] == "system":
+            message["content"] += f" {function_prompt}"
             function_added_to_prompt = True
+            break
 
-    if function_added_to_prompt == False:
-        messages.append({"role": "system", "content": f"""{function_prompt}"""})
+    if not function_added_to_prompt:
+        messages.append({"role": "system", "content": function_prompt})
 
     return messages
 
@@ -2405,16 +2471,7 @@ def custom_prompt(
             if role in role_dict and "post_message" in role_dict[role]
             else ""
         )
-        if isinstance(message["content"], str):
-            prompt += pre_message_str + message["content"] + post_message_str
-        elif isinstance(message["content"], list):
-            text_str = ""
-            for content in message["content"]:
-                if content.get("text", None) is not None and isinstance(
-                    content["text"], str
-                ):
-                    text_str += content["text"]
-            prompt += pre_message_str + text_str + post_message_str
+        prompt += pre_message_str + message["content"] + post_message_str
 
         if role == "assistant":
             prompt += eos_token
@@ -2434,12 +2491,12 @@ def prompt_factory(
     model = model.lower()
     if custom_llm_provider == "ollama":
         return ollama_pt(model=model, messages=messages)
+    if custom_llm_provider == "ollama_chat":
+        return ollama_chat_pt(model=model, messages=messages)
     elif custom_llm_provider == "anthropic":
         if model == "claude-instant-1" or model == "claude-2":
             return anthropic_pt(messages=messages)
-        return anthropic_messages_pt(
-            messages=messages, model=model, llm_provider=custom_llm_provider
-        )
+        return anthropic_messages_pt(messages=messages)
     elif custom_llm_provider == "anthropic_xml":
         return anthropic_messages_pt_xml(messages=messages)
     elif custom_llm_provider == "together_ai":
