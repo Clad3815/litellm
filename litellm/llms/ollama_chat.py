@@ -266,7 +266,7 @@ def get_ollama_response(
     optional_params=None,
     logging_obj=None,
     acompletion: bool = False,
-    model_response=None,
+    model_response=litellm.ModelResponse,
     encoding=None,
 ):
     if api_base.endswith("/api/chat"):
@@ -354,23 +354,23 @@ def get_ollama_response(
     response_json = response.json()
 
     ## RESPONSE OBJECT
-    model_response["choices"][0]["finish_reason"] = "stop"
+    model_response.choices[0].finish_reason = "stop"
     
     content = response_json["message"]["content"]
     if is_function_call(content):
         message = parse_response_with_function_calls(content)
-        model_response["choices"][0]["message"] = message
-        model_response["choices"][0]["finish_reason"] = "tool_calls"
+        model_response.choices[0].message = message
+        model_response.choices[0].finish_reason = "tool_calls"
     else:
-        model_response["choices"][0]["message"]["content"] = content
+        model_response.choices[0].message.content = content
 
-    model_response["created"] = int(time.time())
-    model_response["model"] = "ollama/" + model
+    model_response.created = int(time.time())
+    model_response.model = "ollama/" + model
     prompt_tokens = response_json.get("prompt_eval_count", litellm.token_counter(messages=messages))
     completion_tokens = response_json.get(
         "eval_count", litellm.token_counter(text=response_json["message"]["content"])
     )
-    model_response["usage"] = litellm.Usage(
+    model_response.usage = litellm.Usage(
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         total_tokens=prompt_tokens + completion_tokens,
@@ -539,18 +539,18 @@ async def ollama_acompletion(
             )
 
             ## RESPONSE OBJECT
-            model_response["choices"][0]["finish_reason"] = "stop"
+            model_response.choices[0].finish_reason = "stop"
             
             content = response_json["message"]["content"]
             if is_function_call(content):
                 message = parse_response_with_function_calls(content)
-                model_response["choices"][0]["message"] = message
-                model_response["choices"][0]["finish_reason"] = "tool_calls"
+                model_response.choices[0].message = message
+                model_response.choices[0].finish_reason = "tool_calls"
             else:
-                model_response["choices"][0]["message"]["content"] = content
+                model_response.choices[0].message["content"] = content
 
-            model_response["created"] = int(time.time())
-            model_response["model"] = "ollama_chat/" + data["model"]
+            model_response.created = int(time.time())
+            model_response.model = "ollama_chat/" + data["model"]
             prompt_tokens = response_json.get("prompt_eval_count", litellm.token_counter(messages=data["messages"]))
             completion_tokens = response_json.get(
                 "eval_count",
@@ -558,7 +558,7 @@ async def ollama_acompletion(
                     text=response_json["message"]["content"], count_response_tokens=True
                 ),
             )
-            model_response["usage"] = litellm.Usage(
+            model_response.usage = litellm.Usage(
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 total_tokens=prompt_tokens + completion_tokens,

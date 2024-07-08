@@ -8,28 +8,16 @@ services:
     image: ghcr.io/berriai/litellm:main-stable
     #########################################
     ## Uncomment these lines to start proxy with a config.yaml file ##
-    # volumes:
-    #   - ./proxy_server_config.yaml:/app/config.yaml
-    # command: [ "--config", "./config.yaml", "--port", "4000"]
+    volumes:
+      - ./proxy_server_config.yaml:/app/config.yaml
+    command: [ "--config", "./config.yaml", "--port", "4000"]
     ###############################################
     ports:
       - "4000:4000" # Map the container port to the host, change the host port if necessary
-    environment:
-        DATABASE_URL: "postgresql://postgres:example@db:5432/postgres"
-        STORE_MODEL_IN_DB: "True" # allows adding models to proxy via UI
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # environment:
+    #     DATABASE_URL: "postgresql://postgres:example@db:5432/postgres"
+    #     STORE_MODEL_IN_DB: "True" # allows adding models to proxy via UI
     env_file:
       - .env # Load local .env file
-
- 
-  db:
-    image: postgres
-    restart: always
-    environment:
-      POSTGRES_PASSWORD: example
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready"]
-      interval: 1s
-      timeout: 5s
-      retries: 10
-
-# ...rest of your docker-compose config if any
