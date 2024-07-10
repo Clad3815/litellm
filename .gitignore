@@ -62,3 +62,4 @@ litellm/proxy/_experimental/out/onboarding/index.html
 litellm/tests/log.txt
 litellm/tests/langfuse.log
 litellm/tests/langfuse.log
+application_default_credentials.json

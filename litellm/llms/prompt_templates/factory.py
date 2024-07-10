@@ -133,7 +133,39 @@ def convert_to_ollama_image(openai_image_url: str):
             """Image url not in expected format. Example Expected input - "image_url": "data:image/jpeg;base64,{base64_image}". """
         )
 
-
+def ollama_chat_pt(
+    model, messages
+):
+    processed_messages = []
+    
+    for message in messages:
+        role = message["role"]
+        content = message.get("content", "")
+        
+        if role == "assistant":
+            if "tool_calls" in message:
+                # Convert tool calls to the <|im|function_call> format
+                for call in message["tool_calls"]:
+                    function_name = call["function"]["name"]
+                    arguments = json.loads(call["function"]["arguments"])
+                    function_call = {
+                        "message": content,
+                        "name": function_name,
+                        "arguments": arguments
+                    }
+                    function_call_str = json.dumps(function_call)
+                    processed_messages.append({"role": role, "content": f"<|im|start|function_call>{function_call_str}<|im|end|function_call>"})
+            else:
+                processed_messages.append({"role": role, "content": content})
+        
+        elif role == "tool":
+            # Convert tool results to a user message
+            processed_messages.append({"role": "system", "content": f"<|im|start|function_result>{content}<|im|end|function_result>"})
+            processed_messages.append({"role": "user", "content": "\n"}) ## Injection of a blank user message after tool result to let's the AI know it's must answer otherwise the tool result will be considered as the final response.
+        else:
+            processed_messages.append({"role": role, "content": content})
+    
+    return processed_messages
 def ollama_pt(
     model, messages
 ):  # https://github.com/ollama/ollama/blob/af4cf55884ac54b9e637cd71dadfe9b7a5685877/docs/modelfile.md#template
@@ -2303,18 +2335,52 @@ def _bedrock_tools_pt(tools: List) -> List[BedrockToolBlock]:
 
 # Function call template
 def function_call_prompt(messages: list, functions: list):
-    function_prompt = """Produce JSON OUTPUT ONLY! Adhere to this format {"name": "function_name", "arguments":{"argument_name": "argument_value"}} The following functions are available to you:"""
-    for function in functions:
-        function_prompt += f"""\n{function}\n"""
+    function_list = "\n".join(f"<function>{function}</function>" for function in functions)
+    function_prompt = """
+<function_call_instructions>
+  <output_format>
+    When using a function, produce STRICTLY THIS FOLLOWING OUTPUT ONLY! Adhere STRICTLY to this format, include no additional information or formatting: <|im|start|function_call>{"name": "{function_name}", "arguments": {"arg": "value", ...}}<|im|end|function_call>
+    If not using a function, ignore these instructions and continue your task.
+  </output_format>
+  
+  <usage_rules>
+    <rule>Only use functions when necessary to complete the user's request.</rule>
+    <rule>Choose the most appropriate function for the task.</rule>
+    <rule>Use only one function at a time.</rule>
+    <rule>Ensure all required arguments are provided when calling a function.</rule>
+  </usage_rules>
+  """
+    function_prompt += f"""
+  <available_functions>
+    The following functions are available to you:
+    {function_list}
+  </available_functions>
+  
+  <invocation_instructions>
+    1. Analyze the user's request carefully.
+    2. Determine if a function call is necessary to fulfill the request.
+    3. If a function is needed:
+       a. Select the most appropriate function.
+       b. Construct the JSON output with the function name and required arguments.
+       c. Return the correct structure to call the function, don't include any else than the opening and closing tags (with the content inside).
+       d. Double check your answer when using a function, it's forbidden to start your answer with something else than the opening tag and end with something else than the closing tag.
+       e. This format is very strict, make sure to follow it exactly.
+    4. If no function is needed, continue your task normally.
+    5. After calling the function you will get the result between the tags <|im|start|function_result> and <|im|end|function_result>.
+    6. The user is not able to see the content between the tags, only the assistant can. Use the content to continue the conversation and notify the user of the result.
+  </invocation_instructions>  
+</function_call_instructions>
+"""
 
     function_added_to_prompt = False
     for message in messages:
-        if "system" in message["role"]:
-            message["content"] += f""" {function_prompt}"""
+        if message["role"] == "system":
+            message["content"] += f" {function_prompt}"
             function_added_to_prompt = True
+            break
 
-    if function_added_to_prompt == False:
-        messages.append({"role": "system", "content": f"""{function_prompt}"""})
+    if not function_added_to_prompt:
+        messages.append({"role": "system", "content": function_prompt})
 
     return messages
 
@@ -2413,6 +2479,8 @@ def prompt_factory(
     model = model.lower()
     if custom_llm_provider == "ollama":
         return ollama_pt(model=model, messages=messages)
+    if custom_llm_provider == "ollama_chat":
+        return ollama_chat_pt(model=model, messages=messages)
     elif custom_llm_provider == "anthropic":
         if model == "claude-instant-1" or model == "claude-2":
             return anthropic_pt(messages=messages)

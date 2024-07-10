@@ -2486,6 +2486,11 @@ def completion(
                 or os.environ.get("OLLAMA_API_KEY")
                 or litellm.api_key
             )
+            messages = prompt_factory(
+                model=model,
+                messages=messages,
+                custom_llm_provider=custom_llm_provider,
+            )
             ## LOGGING
             generator = ollama_chat.get_ollama_response(
                 api_base,
