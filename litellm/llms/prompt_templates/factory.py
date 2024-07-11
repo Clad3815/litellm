@@ -143,7 +143,7 @@ def ollama_chat_pt(
         content = message.get("content", "")
         
         if role == "assistant":
-            if "tool_calls" in message:
+            if "tool_calls" in message and message["tool_calls"]:
                 # Convert tool calls to the <|im|function_call> format
                 for call in message["tool_calls"]:
                     function_name = call["function"]["name"]
@@ -160,8 +160,8 @@ def ollama_chat_pt(
         
         elif role == "tool":
             # Convert tool results to a user message
-            processed_messages.append({"role": "system", "content": f"<|im|start|function_result>{content}<|im|end|function_result>"})
-            processed_messages.append({"role": "user", "content": "\n"}) ## Injection of a blank user message after tool result to let's the AI know it's must answer otherwise the tool result will be considered as the final response.
+            processed_messages.append({"role": "system", "content": f"<hidden_for_user><|im|start|function_result>{content}<|im|end|function_result></hidden_for_user>"})
+            # processed_messages.append({"role": "assistant", "content": ""}) ## Injection of a blank user message after tool result to let's the AI know it's must answer otherwise the tool result will be considered as the final response.
         else:
             processed_messages.append({"role": role, "content": content})
     
@@ -2366,8 +2366,7 @@ def function_call_prompt(messages: list, functions: list):
        d. Double check your answer when using a function, it's forbidden to start your answer with something else than the opening tag and end with something else than the closing tag.
        e. This format is very strict, make sure to follow it exactly.
     4. If no function is needed, continue your task normally.
-    5. After calling the function you will get the result between the tags <|im|start|function_result> and <|im|end|function_result>.
-    6. The user is not able to see the content between the tags, only the assistant can. Use the content to continue the conversation and notify the user of the result.
+    5. After calling the function you will get the result between the tags <|im|start|function_result> and <|im|end|function_result>. Assume than the user can't see the content between the tags, only the assistant can. So you must provide the result to the user
   </invocation_instructions>  
 </function_call_instructions>
 """
