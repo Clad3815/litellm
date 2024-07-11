@@ -10,16 +10,19 @@ from litellm import verbose_logger
 import litellm
 import httpx
 import aiohttp
+import re
+import json_repair
 
-FUNCTION_CALL_START = "<|im|start|function_call>"
-FUNCTION_CALL_END = "<|im|end|function_call>"
+FUNCTION_CALL_START = "<|im_function_call_start|>"
+FUNCTION_CALL_END = "<|im_function_call_end|>"
 
 def is_function_call(content):
     return content.strip().startswith(FUNCTION_CALL_START) and content.strip().endswith(FUNCTION_CALL_END)
 
 def parse_function_call(content):
     json_str = content.strip()[len(FUNCTION_CALL_START):-len(FUNCTION_CALL_END)]
-    return json.loads(json_str)
+    print(json_str)
+    return json_repair.loads(json_str)
 
 def is_potential_function_call_start(content):
     return FUNCTION_CALL_START.strip().startswith(content)
@@ -205,6 +208,61 @@ class OllamaChatConfig:
         return optional_params
 
 
+def parse_response_with_function_calls(content):    
+    # Pattern to match function calls including start and end tags
+    pattern = re.escape(FUNCTION_CALL_START) + r'(.*?)' + re.escape(FUNCTION_CALL_END)
+    
+    # Find all function calls
+    function_calls = list(re.finditer(pattern, content, re.DOTALL))
+    
+    tool_calls = []
+    message_parts = []
+    last_end = 0
+    
+    for match in function_calls:
+        # Add text before this function call to message_parts
+        pre_text = content[last_end:match.start()].strip()
+        if pre_text:
+            message_parts.append(pre_text)
+        
+        # Process the function call
+        json_str = match.group(1).strip()
+        try:
+            function_data = json.loads(json_str)
+            tool_call = {
+                "id": f"call_{str(uuid.uuid4())}",
+                "function": {
+                    "name": function_data["name"],
+                    "arguments": json.dumps(function_data["arguments"]),
+                },
+                "type": "function",
+            }
+            tool_calls.append(tool_call)
+        except json.JSONDecodeError:
+            # If JSON parsing fails, treat it as normal text
+            message_parts.append(match.group(0))
+        
+        last_end = match.end()
+    
+    # Add any remaining text after the last function call
+    post_text = content[last_end:].strip()
+    if post_text:
+        message_parts.append(post_text)
+    
+    # Join all non-empty parts of message_content
+    final_message_content = ' '.join(message_parts).strip()
+    
+    print({
+        "content": final_message_content,
+        "tool_calls": tool_calls
+    })
+    message = litellm.Message(
+        content=final_message_content if final_message_content else None,
+        tool_calls=tool_calls if tool_calls else None
+    )
+    
+    return message
+
 # ollama implementation
 def get_ollama_response(
     api_base="http://localhost:11434",
@@ -306,20 +364,7 @@ def get_ollama_response(
     
     content = response_json["message"]["content"]
     if is_function_call(content):
-        function_call = parse_function_call(content)
-        message = litellm.Message(
-            content=None,
-            tool_calls=[
-                {
-                    "id": f"call_{str(uuid.uuid4())}",
-                    "function": {
-                        "name": function_call["name"],
-                        "arguments": json.dumps(function_call["arguments"]),
-                    },
-                    "type": "function",
-                }
-            ],
-        )
+        message = parse_response_with_function_calls(content)
         model_response["choices"][0]["message"] = message
         model_response["choices"][0]["finish_reason"] = "tool_calls"
     else:
@@ -525,20 +570,7 @@ async def ollama_acompletion(
             
             content = response_json["message"]["content"]
             if is_function_call(content):
-                function_call = parse_function_call(content)
-                message = litellm.Message(
-                    content=None,
-                    tool_calls=[
-                        {
-                            "id": f"call_{str(uuid.uuid4())}",
-                            "function": {
-                                "name": function_call["name"],
-                                "arguments": json.dumps(function_call["arguments"]),
-                            },
-                            "type": "function",
-                        }
-                    ],
-                )
+                message = parse_response_with_function_calls(content)
                 model_response["choices"][0]["message"] = message
                 model_response["choices"][0]["finish_reason"] = "tool_calls"
             else:

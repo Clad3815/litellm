@@ -63,6 +63,8 @@ RUN pip install *.whl /wheels/* --no-index --find-links=/wheels/ && rm -f *.whl 
 
 COPY application_default_credentials.json /root/.config/gcloud/application_default_credentials.json
 
+RUN pip install json_repair
+
 # Generate prisma client
 RUN prisma generate
 RUN chmod +x entrypoint.sh

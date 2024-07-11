@@ -26,6 +26,10 @@ from litellm.types.llms.anthropic import *
 from litellm.types.llms.bedrock import MessageBlock as BedrockMessageBlock
 from litellm.types.utils import GenericImageParsingChunk
 
+FUNCTION_CALL_START = "<|im_function_call_start|>"
+FUNCTION_CALL_END = "<|im_function_call_end|>"
+FUNCTION_RESULT_START = "<|im_function_result_start|>"
+FUNCTION_RESULT_END = "<|im_function_result_end|>"
 
 def default_pt(messages):
     return " ".join(message["content"] for message in messages)
@@ -133,9 +137,9 @@ def convert_to_ollama_image(openai_image_url: str):
             """Image url not in expected format. Example Expected input - "image_url": "data:image/jpeg;base64,{base64_image}". """
         )
 
-def ollama_chat_pt(
-    model, messages
-):
+
+
+def ollama_chat_pt(model, messages):
     processed_messages = []
     
     for message in messages:
@@ -144,28 +148,33 @@ def ollama_chat_pt(
         
         if role == "assistant":
             if "tool_calls" in message and message["tool_calls"]:
-                # Convert tool calls to the <|im|function_call> format
+                # Combine content and tool calls
+                combined_content = content if content else ""
                 for call in message["tool_calls"]:
                     function_name = call["function"]["name"]
                     arguments = json.loads(call["function"]["arguments"])
                     function_call = {
-                        "message": content,
                         "name": function_name,
                         "arguments": arguments
                     }
                     function_call_str = json.dumps(function_call)
-                    processed_messages.append({"role": role, "content": f"<|im|start|function_call>{function_call_str}<|im|end|function_call>"})
+                    combined_content += f"{FUNCTION_CALL_START}{function_call_str}{FUNCTION_CALL_END}"
+                
+                processed_messages.append({"role": role, "content": combined_content})
             else:
                 processed_messages.append({"role": role, "content": content})
         
         elif role == "tool":
-            # Convert tool results to a user message
-            processed_messages.append({"role": "system", "content": f"<hidden_for_user><|im|start|function_result>{content}<|im|end|function_result></hidden_for_user>"})
-            # processed_messages.append({"role": "assistant", "content": ""}) ## Injection of a blank user message after tool result to let's the AI know it's must answer otherwise the tool result will be considered as the final response.
+            # Convert tool results to a system message with special tags
+            processed_messages.append({
+                "role": "system", 
+                "content": f"<hidden_for_user>{FUNCTION_RESULT_START}{content}{FUNCTION_RESULT_END}</hidden_for_user>"
+            })
         else:
             processed_messages.append({"role": role, "content": content})
     
     return processed_messages
+
 def ollama_pt(
     model, messages
 ):  # https://github.com/ollama/ollama/blob/af4cf55884ac54b9e637cd71dadfe9b7a5685877/docs/modelfile.md#template
@@ -2339,35 +2348,39 @@ def function_call_prompt(messages: list, functions: list):
     function_prompt = """
 <function_call_instructions>
   <output_format>
-    When using a function, produce STRICTLY THIS FOLLOWING OUTPUT ONLY! Adhere STRICTLY to this format, include no additional information or formatting: <|im|start|function_call>{"name": "{function_name}", "arguments": {"arg": "value", ...}}<|im|end|function_call>
-    If not using a function, ignore these instructions and continue your task.
+    To call a function, add this following format to your answer. Use STRICTLY this format:
+    <|im_function_call_start|>{"name": "{function_name}", "arguments": {"arg": "value", ...}}<|im_function_call_end|>
   </output_format>
-  
-  <usage_rules>
-    <rule>Only use functions when necessary to complete the user's request.</rule>
-    <rule>Choose the most appropriate function for the task.</rule>
-    <rule>Use only one function at a time.</rule>
-    <rule>Ensure all required arguments are provided when calling a function.</rule>
-  </usage_rules>
   """
     function_prompt += f"""
   <available_functions>
-    The following functions are available to you:
+    Available functions:
     {function_list}
   </available_functions>
   
-  <invocation_instructions>
-    1. Analyze the user's request carefully.
-    2. Determine if a function call is necessary to fulfill the request.
-    3. If a function is needed:
-       a. Select the most appropriate function.
-       b. Construct the JSON output with the function name and required arguments.
-       c. Return the correct structure to call the function, don't include any else than the opening and closing tags (with the content inside).
-       d. Double check your answer when using a function, it's forbidden to start your answer with something else than the opening tag and end with something else than the closing tag.
-       e. This format is very strict, make sure to follow it exactly.
-    4. If no function is needed, continue your task normally.
-    5. After calling the function you will get the result between the tags <|im|start|function_result> and <|im|end|function_result>. Assume than the user can't see the content between the tags, only the assistant can. So you must provide the result to the user
-  </invocation_instructions>  
+  <usage_guidelines>
+    1. Use functions only when necessary to fulfill the user's request.
+    2. Choose the most appropriate function for the task.
+    3. Ensure all required arguments are provided when calling a function.
+  </usage_guidelines>
+
+  <result_handling>
+    1. The function result will be provided between <|im_function_result_start|> and <|im_function_result_end|> tags.
+    2. CRITICAL: The content between these tags is visible ONLY to the assistant (you), NOT to the user.
+    3. You must always process and interpret this result, then provide an appropriate response to the user based on this information.
+    4. Never directly mention these tags or their content to the user.
+    5. Formulate your response as if you naturally had access to this information, without revealing the specific source.
+  </result_handling>
+
+  <response_structure>
+    1. Carefully analyze the user's request.
+    2. If a function is necessary:
+       a. Call the function using the specified format.
+       b. Wait for the function result.
+       c. Interpret the result (visible only to you).
+       d. Formulate a clear and informative response for the user based on this result.
+    3. Always ensure your response is coherent and useful from the user's perspective, who does not have access to the raw function results.
+  </response_structure>
 </function_call_instructions>
 """
 
