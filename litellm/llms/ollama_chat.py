@@ -17,7 +17,8 @@ FUNCTION_CALL_START = "<|im_function_call_start|>"
 FUNCTION_CALL_END = "<|im_function_call_end|>"
 
 def is_function_call(content):
-    return content.strip().startswith(FUNCTION_CALL_START) and content.strip().endswith(FUNCTION_CALL_END)
+    pattern = re.escape(FUNCTION_CALL_START) + r'.*?' + re.escape(FUNCTION_CALL_END)
+    return bool(re.search(pattern, content, re.DOTALL))
 
 def parse_function_call(content):
     json_str = content.strip()[len(FUNCTION_CALL_START):-len(FUNCTION_CALL_END)]
