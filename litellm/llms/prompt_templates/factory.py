@@ -168,7 +168,7 @@ def ollama_chat_pt(model, messages):
             # Convert tool results to a system message with special tags
             processed_messages.append({
                 "role": "system", 
-                "content": f"<hidden_for_user>{FUNCTION_RESULT_START}{content}{FUNCTION_RESULT_END}</hidden_for_user>"
+                "content": f"<|start_hidden_for_user|>{FUNCTION_RESULT_START}{content}{FUNCTION_RESULT_END}<|end_hidden_for_user|>"
             })
         else:
             processed_messages.append({"role": role, "content": content})
@@ -2362,14 +2362,14 @@ def function_call_prompt(messages: list, functions: list):
     1. Use functions only when necessary to fulfill the user's request.
     2. Choose the most appropriate function for the task.
     3. Ensure all required arguments are provided when calling a function.
+    4. You have to wait the next message after your function call to get the result, after which you can continue the conversation.
   </usage_guidelines>
 
   <result_handling>
-    1. The function result will be provided between <|im_function_result_start|> and <|im_function_result_end|> tags.
-    2. CRITICAL: The content between these tags is visible ONLY to the assistant (you), NOT to the user.
-    3. You must always process and interpret this result, then provide an appropriate response to the user based on this information.
-    4. Never directly mention these tags or their content to the user.
-    5. Formulate your response as if you naturally had access to this information, without revealing the specific source.
+    1. CRITICAL: The function result is visible ONLY to the assistant (you), NOT to the user.
+    2. You must always process and interpret this result, then provide an appropriate response to the user based on this information.
+    3. Never directly mention these tags or their content to the user.
+    4. Formulate your response as if you naturally had access to this information, without revealing the specific source.
   </result_handling>
 
   <response_structure>

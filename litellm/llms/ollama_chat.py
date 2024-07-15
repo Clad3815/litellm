@@ -5,13 +5,14 @@ import time
 import json
 import uuid
 import traceback
-from typing import Optional
+from typing import Optional, Dict, Any, List
 from litellm import verbose_logger
 import litellm
 import httpx
 import aiohttp
 import re
 import json_repair
+import difflib
 
 FUNCTION_CALL_START = "<|im_function_call_start|>"
 FUNCTION_CALL_END = "<|im_function_call_end|>"
@@ -19,14 +20,6 @@ FUNCTION_CALL_END = "<|im_function_call_end|>"
 def is_function_call(content):
     pattern = re.escape(FUNCTION_CALL_START) + r'.*?' + re.escape(FUNCTION_CALL_END)
     return bool(re.search(pattern, content, re.DOTALL))
-
-def parse_function_call(content):
-    json_str = content.strip()[len(FUNCTION_CALL_START):-len(FUNCTION_CALL_END)]
-    print(json_str)
-    return json_repair.loads(json_str)
-
-def is_potential_function_call_start(content):
-    return FUNCTION_CALL_START.strip().startswith(content)
 
 class OllamaError(Exception):
     def __init__(self, status_code, message):
@@ -383,8 +376,6 @@ def get_ollama_response(
         total_tokens=prompt_tokens + completion_tokens,
     )
     return model_response
-
-
 def ollama_completion_stream(url, api_key, data, logging_obj):
     _request = {
         "url": f"{url}",
@@ -394,12 +385,11 @@ def ollama_completion_stream(url, api_key, data, logging_obj):
     }
     if api_key is not None:
         _request["headers"] = "Bearer {}".format(api_key)
+    
     with httpx.stream(**_request) as response:
         try:
             if response.status_code != 200:
-                raise OllamaError(
-                    status_code=response.status_code, message=response.iter_lines()
-                )
+                raise OllamaError(status_code=response.status_code, message=response.iter_lines())
 
             streamwrapper = litellm.CustomStreamWrapper(
                 completion_stream=response.iter_lines(),
@@ -409,55 +399,68 @@ def ollama_completion_stream(url, api_key, data, logging_obj):
             )
 
             buffer = ""
+            in_function_call = False
             for transformed_chunk in streamwrapper:
-                chunk_content = transformed_chunk.choices[0].delta.content
-                if chunk_content is not None:
-                    buffer += chunk_content
-                    
-                    if is_function_call(buffer):
-                        function_call = parse_function_call(buffer)
-                        delta = litellm.utils.Delta(
-                            content=None,
-                            tool_calls=[
-                                {
-                                    "id": f"call_{str(uuid.uuid4())}",
-                                    "function": {
-                                        "name": function_call["name"],
-                                        "arguments": json.dumps(function_call["arguments"]),
-                                    },
-                                    "type": "function",
-                                }
-                            ],
-                        )
-                        transformed_chunk.choices[0].delta = delta
-                        transformed_chunk.choices[0].finish_reason = "tool_calls"
-                        yield transformed_chunk
-                        buffer = ""  # Reset buffer after yielding function call
-                    elif not is_potential_function_call_start(buffer):
-                        # If buffer doesn't potentially start a function call, yield it
-                        transformed_chunk.choices[0].delta.content = buffer
-                        yield transformed_chunk
-                        buffer = ""  # Reset buffer after yielding
-                elif buffer:
-                    # If we have content in the buffer but received an empty chunk,
-                    # yield the buffer content
-                    transformed_chunk.choices[0].delta.content = buffer
-                    yield transformed_chunk
-                    buffer = ""
+                if transformed_chunk.choices[0].delta.content:
+                    current_content = transformed_chunk.choices[0].delta.content
+                    buffer += current_content
 
-            # Yield any remaining content in the buffer
+                    if FUNCTION_CALL_START in buffer and not in_function_call:
+                        in_function_call = True
+                        start_index = buffer.index(FUNCTION_CALL_START)
+                        if start_index > 0:
+                            content_chunk = transformed_chunk.copy()
+                            content_chunk.choices[0].delta.content = buffer[:start_index]
+                            yield content_chunk
+                        buffer = buffer[start_index:]
+                    elif FUNCTION_CALL_END in buffer and in_function_call:
+                        end_index = buffer.index(FUNCTION_CALL_END) + len(FUNCTION_CALL_END)
+                        function_call = buffer[:end_index]
+                        buffer = buffer[end_index:]
+                        in_function_call = False
+                        
+                        try:
+                            function_data = json_repair.loads(function_call[len(FUNCTION_CALL_START):-len(FUNCTION_CALL_END)])
+                            delta = litellm.utils.Delta(
+                                content=None,
+                                tool_calls=[
+                                    {
+                                        "id": f"call_{str(uuid.uuid4())}",
+                                        "function": {
+                                            "name": function_data["name"],
+                                            "arguments": json.dumps(function_data["arguments"]),
+                                        },
+                                        "type": "function",
+                                    }
+                                ],
+                            )
+                            transformed_chunk.choices[0].delta = delta
+                            transformed_chunk.choices[0].finish_reason = "tool_calls"
+                            yield transformed_chunk
+                        except json.JSONDecodeError:
+                            # If JSON parsing fails, yield the raw content
+                            error_chunk = transformed_chunk.copy()
+                            error_chunk.choices[0].delta.content = function_call
+                            yield error_chunk
+
+                    if not in_function_call and buffer:
+                        content_chunk = transformed_chunk.copy()
+                        content_chunk.choices[0].delta.content = buffer
+                        yield content_chunk
+                        buffer = ""
+                else:
+                    yield transformed_chunk
+
+            # Handle any remaining content
             if buffer:
-                final_chunk = transformed_chunk.__class__(
-                    choices=[{"delta": {"content": buffer}}],
-                    model=data["model"],
-                )
+                final_chunk = transformed_chunk.copy()
+                final_chunk.choices[0].delta.content = buffer
                 yield final_chunk
+
         except Exception as e:
             raise e
 
-async def ollama_async_streaming(
-    url, api_key, data, model_response, encoding, logging_obj
-):
+async def ollama_async_streaming(url, api_key, data, model_response, encoding, logging_obj):
     try:
         client = httpx.AsyncClient()
         _request = {
@@ -468,11 +471,10 @@ async def ollama_async_streaming(
         }
         if api_key is not None:
             _request["headers"] = "Bearer {}".format(api_key)
+        
         async with client.stream(**_request) as response:
             if response.status_code != 200:
-                raise OllamaError(
-                    status_code=response.status_code, message=response.text
-                )
+                raise OllamaError(status_code=response.status_code, message=response.text)
 
             streamwrapper = litellm.CustomStreamWrapper(
                 completion_stream=response.aiter_lines(),
@@ -482,52 +484,100 @@ async def ollama_async_streaming(
             )
 
             buffer = ""
+            in_function_call = False
             async for transformed_chunk in streamwrapper:
-                chunk_content = transformed_chunk.choices[0].delta.content
-                if chunk_content is not None:
-                    buffer += chunk_content
-                    
-                    if is_function_call(buffer):
-                        function_call = parse_function_call(buffer)
-                        delta = litellm.utils.Delta(
-                            content=None,
-                            tool_calls=[
-                                {
-                                    "id": f"call_{str(uuid.uuid4())}",
-                                    "function": {
-                                        "name": function_call["name"],
-                                        "arguments": json.dumps(function_call["arguments"]),
-                                    },
-                                    "type": "function",
-                                }
-                            ],
-                        )
-                        transformed_chunk.choices[0].delta = delta
-                        transformed_chunk.choices[0].finish_reason = "tool_calls"
-                        yield transformed_chunk
-                        buffer = ""  # Reset buffer after yielding function call
-                    elif not is_potential_function_call_start(buffer):
-                        # If buffer doesn't potentially start a function call, yield it
-                        transformed_chunk.choices[0].delta.content = buffer
-                        yield transformed_chunk
-                        buffer = ""  # Reset buffer after yielding
-                elif buffer:
-                    # If we have content in the buffer but received an empty chunk,
-                    # yield the buffer content
-                    transformed_chunk.choices[0].delta.content = buffer
-                    yield transformed_chunk
-                    buffer = ""
+                if transformed_chunk.choices[0].delta.content:
+                    current_content = transformed_chunk.choices[0].delta.content
+                    buffer += current_content
 
-            # Yield any remaining content in the buffer
+                    if FUNCTION_CALL_START in buffer and not in_function_call:
+                        in_function_call = True
+                        start_index = buffer.index(FUNCTION_CALL_START)
+                        if start_index > 0:
+                            content_chunk = transformed_chunk.copy()
+                            content_chunk.choices[0].delta.content = buffer[:start_index]
+                            yield content_chunk
+                        buffer = buffer[start_index:]
+                    elif FUNCTION_CALL_END in buffer and in_function_call:
+                        end_index = buffer.index(FUNCTION_CALL_END) + len(FUNCTION_CALL_END)
+                        function_call = buffer[:end_index]
+                        buffer = buffer[end_index:]
+                        in_function_call = False
+                        
+                        try:
+                            function_data = json_repair.loads(function_call[len(FUNCTION_CALL_START):-len(FUNCTION_CALL_END)])
+                            delta = litellm.utils.Delta(
+                                content=None,
+                                tool_calls=[
+                                    {
+                                        "id": f"call_{str(uuid.uuid4())}",
+                                        "function": {
+                                            "name": function_data["name"],
+                                            "arguments": json.dumps(function_data["arguments"]),
+                                        },
+                                        "type": "function",
+                                    }
+                                ],
+                            )
+                            transformed_chunk.choices[0].delta = delta
+                            transformed_chunk.choices[0].finish_reason = "tool_calls"
+                            yield transformed_chunk
+                        except json.JSONDecodeError:
+                            # If JSON parsing fails, yield the raw content
+                            error_chunk = transformed_chunk.copy()
+                            error_chunk.choices[0].delta.content = function_call
+                            yield error_chunk
+
+                    if not in_function_call and buffer:
+                        content_chunk = transformed_chunk.copy()
+                        content_chunk.choices[0].delta.content = buffer
+                        yield content_chunk
+                        buffer = ""
+                else:
+                    yield transformed_chunk
+
+            # Handle any remaining content
             if buffer:
-                final_chunk = transformed_chunk.__class__(
-                    choices=[{"delta": {"content": buffer}}],
-                    model=data["model"],
-                )
+                final_chunk = transformed_chunk.copy()
+                final_chunk.choices[0].delta.content = buffer
                 yield final_chunk
+
     except Exception as e:
-        verbose_logger.error("LiteLLM.gemini(): Exception occured - {}".format(str(e)))
+        verbose_logger.error(f"LiteLLM.ollama_async_streaming(): Exception occurred - {str(e)}")
         verbose_logger.debug(traceback.format_exc())
+        raise e
+
+def process_function_call(function_call, chunk):
+    json_str = function_call[len(FUNCTION_CALL_START):-len(FUNCTION_CALL_END)]
+    try:
+        function_data = json.loads(json_str)
+        tool_call_chunk = chunk.copy()
+        tool_call_chunk.choices[0].delta.content = None
+        tool_call_chunk.choices[0].delta.role = "assistant"
+        tool_call_chunk.choices[0].delta.tool_calls = [{
+            "id": f"call_{str(uuid.uuid4())}",
+            "function": {
+                "name": function_data["name"],
+                "arguments": json.dumps(function_data["arguments"]),
+            },
+            "type": "function",
+        }]
+        return tool_call_chunk
+    except json.JSONDecodeError:
+        # If JSON parsing fails, return the raw content
+        error_chunk = chunk.copy()
+        error_chunk.choices[0].delta.content = function_call
+        return error_chunk
+
+def extract_safe_content(buffer):
+    for i in range(len(buffer), 0, -1):
+        if not is_potential_function_call_start(buffer[:i]):
+            return buffer[:i], buffer[i:]
+    return "", buffer
+
+def is_potential_function_call_start(s):
+    return any(FUNCTION_CALL_START.startswith(s[-i:]) for i in range(1, len(s) + 1))
+
 
 async def ollama_acompletion(
     url,
